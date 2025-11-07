@@ -1,0 +1,280 @@
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-06-13T11-33-47Z
+    command: server /data --console-address :9001
+    ports:
+      - 9000:9000
+      - 9001:9001
+    volumes:
+      - minio_data:/data
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:9000/minio/health/live
+    networks:
+      big-data-net:
+
+  kafka-landoop:
+    image: lensesio/fast-data-dev:3.9.0
+    hostname: kafka-landoop
+    environment:
+      ADV_HOST: kafka-landoop
+      RUNNING_SAMPLEDATA: 1
+      RUNTESTS: 0
+      RUNNING_REST: 1
+      KAFKA_LISTENERS: PLAINTEXT://:9092,DOCKERCOMPOSE://:19092,CONTROLLER://:16062
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-landoop:9092,DOCKERCOMPOSE://kafka-landoop:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: >
+        DOCKERCOMPOSE:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,
+        SSL:SSL,SASL_PLAINTEXT:SASL_PLAINTEXT,SASL_SSL:SASL_SSL
+      DISABLE: debezium-postgres,debezium-sqlserver,debezium-jdbc
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_S3_ENDPOINT: http://minio:9000
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      # JMX_PORT: 9581
+      # SCHEMA_REGISTRY_JMX_PORT: 9582
+      # CONNECT_JMX_PORT: 9584
+      # KAFKA_OPTS: "-Djava.rmi.server.hostname=kafka-landoop"
+      # CONNECT_OPTS: "-Djava.rmi.server.hostname=kafka-landoop"
+      # SCHEMA_REGISTRY_OPTS: "-Djava.rmi.server.hostname=kafka-landoop"
+      # CONNECT_REST_ADVERTISED_HOST_NAME: kafka-landoop
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5' 
+          memory: 2G 
+    ports:
+      - 9092:9092
+      - 8083:8083
+      - 3030:3030
+      - 8082:8082
+      - 8081:8081
+      - 9581:9581
+      - 9582:9582
+      - 9584:9584
+    volumes:
+      - kafka-data-volume:/data
+      - ./kafka_connectors:/connectors
+    networks:
+      big-data-net:
+
+  lenses-hq:
+    image: lensesio/lenses-hq:6.0
+    pull_policy: always
+    command: /app/config.yaml
+    ports:
+      - 9991:9991
+    depends_on:
+      postgres:
+        condition: service_healthy
+      create-configs:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "lenses-hq", "is-up", "lenses-hq:9991"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    volumes:
+      - lenses-hq-volume:/app
+    networks:
+      big-data-net:
+
+  lenses-agent:
+    image: lensesio/lenses-agent:6.0
+    pull_policy: always
+    environment:
+      DEMO_HQ_URL: http://lenses-hq:9991
+      DEMO_HQ_USER: admin
+      DEMO_HQ_PASSWORD: admin
+      DEMO_AGENTKEY_PATH: /mnt/settings/DEMO_AGENTKEY
+      LENSES_HEAP_OPTS: -Xmx1536m -Xms512m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      lenses-hq:
+        condition: service_healthy
+      create-configs:
+        condition: service_completed_successfully
+    volumes:
+      - lenses-agent-volume:/mnt/settings
+    networks:
+      big-data-net:
+
+  postgres:
+    image: postgres
+    environment:
+      POSTGRES_USER: lenses
+      POSTGRES_PASSWORD: lenses
+    depends_on:
+      create-configs:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lenses"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres-volume:/docker-entrypoint-initdb.d
+    networks:
+      big-data-net:
+
+  create-configs:
+    image: busybox
+    command: >
+      sh -c '
+        printenv hq.config.yaml > /hq/config.yaml;
+        printenv agent.lenses.conf > /agent/lenses.conf;
+        printenv agent.provisioning.yaml > /agent/provisioning.yaml;
+        printenv postgres.init.sql > /postgres/init.sql
+      '
+    environment:
+      hq.config.yaml: |
+        http:
+          address: :9991
+          # Otherwise TLS might be required:
+          secureSessionCookies: false
+        auth:
+          administrators:
+            - admin
+          users:
+           - username: admin
+             # Password is admin
+             password: $$2a$$10$$DPQYpxj4Y2iTWeuF1n.ItewXnbYXh5/E9lQwDJ/cI/.gBboW2Hodm
+        agents:
+          address: :10000
+        database:
+          host: postgres:5432
+          username: lenses
+          password: lenses
+          database: hq
+        logger:
+          mode: text
+        license:
+          # Community license key
+          key: license_key_2SFZ0BesCNu6NFv0-EOSIvY22ChSzNWXa5nSds2l4z3y7aBgRPKCVnaeMlS57hHNVboR2kKaQ8Mtv1LFt0MPBBACGhDT5If8PmTraUM5xXLz4MYv
+          # EULA can be found at https://lenses.io/legals/eula
+          acceptEULA: ${ACCEPT_EULA}
+      agent.lenses.conf: |
+        lenses.storage.postgres.host="postgres"
+        lenses.storage.postgres.port=5432
+        lenses.storage.postgres.database=agent
+        lenses.storage.postgres.username=lenses
+        lenses.storage.postgres.password=lenses
+        lenses.provisioning.path="/mnt/settings"
+        lenses.sql.state.dir="/data/lsql-state-dir"
+        lenses.secret.file="/data/security.conf"
+        lenses.storage.directory="/data/lenses"
+      agent.provisioning.yaml: |
+        lensesHq:
+          - configuration:
+              agentKey:
+                value: $${LENSESHQ_AGENT_KEY}
+              port:
+                value: 10000
+              server:
+                value: lenses-hq
+            name: lenses-hq
+            tags: ['hq']
+            version: 1
+        kafka:
+          - name: kafka
+            version: 1
+            tags: [ 'kafka', 'dev' ]
+            configuration:
+              metricsType:
+                value: JMX
+              metricsPort:
+                value: 9581
+              kafkaBootstrapServers:
+                value: [PLAINTEXT://kafka-landoop:19092]
+              protocol:
+                value: PLAINTEXT
+        confluentSchemaRegistry:
+          - name: schema-registry
+            version: 1
+            tags: [ 'dev' ]
+            configuration:
+              schemaRegistryUrls:
+                value: [http://kafka-landoop:8081]
+              metricsType:
+                value: JMX
+              metricsPort:
+                value: 9582
+        connect:
+          - name: dev
+            version: 1
+            tags: [ 'dev' ]
+            configuration:
+              workers:
+                value: [http://kafka-landoop:8083]
+              aes256Key:
+                value: 0123456789abcdef0123456789abcdef
+              metricsType:
+                value: JMX
+              metricsPort:
+                value: 9584
+      postgres.init.sql: |
+        CREATE DATABASE hq;
+        CREATE DATABASE agent;
+    volumes:
+      - lenses-hq-volume:/hq
+      - lenses-agent-volume:/agent
+      - postgres-volume:/postgres
+    networks:
+      big-data-net:
+
+  metastore-db:
+    image: postgres
+    container_name: metastore-db
+    hostname: metastore-db
+    environment:
+      - POSTGRES_DB=metastore_db
+      - POSTGRES_USER=hive
+      - POSTGRES_PASSWORD=hive
+    volumes:
+      - postgres_metastore_data:/var/lib/postgresql/data
+    networks:
+      big-data-net:
+
+  hive-metastore:
+    hostname: hive-metastore
+    image: 'starburstdata/hive:3.1.2-e.18'
+    ports:
+      - '9083:9083' # Metastore Thrift
+    environment:
+      HIVE_METASTORE_DRIVER: org.postgresql.Driver
+      HIVE_METASTORE_JDBC_URL: jdbc:postgresql://metastore-db:5432/metastore_db
+      HIVE_METASTORE_USER: hive
+      HIVE_METASTORE_PASSWORD: hive
+      HIVE_METASTORE_WAREHOUSE_DIR: s3a://hudi-bucket-test/hive
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_PATH_STYLE_ACCESS: "true"
+      REGION: ""
+      GOOGLE_CLOUD_KEY_FILE_PATH: ""
+      AZURE_ADL_CLIENT_ID: ""
+      AZURE_ADL_CREDENTIAL: ""
+      AZURE_ADL_REFRESH_URL: ""
+      AZURE_ABFS_STORAGE_ACCOUNT: ""
+      AZURE_ABFS_ACCESS_KEY: ""
+      AZURE_WASB_STORAGE_ACCOUNT: ""
+      AZURE_ABFS_OAUTH: ""
+      AZURE_ABFS_OAUTH_TOKEN_PROVIDER: ""
+      AZURE_ABFS_OAUTH_CLIENT_ID: ""
+      AZURE_ABFS_OAUTH_SECRET: ""
+      AZURE_ABFS_OAUTH_ENDPOINT: ""
+      AZURE_WASB_ACCESS_KEY: ""
+      HIVE_METASTORE_USERS_IN_ADMIN_ROLE: "admin"
+    depends_on:
+      - metastore-db
+    networks:
+      big-data-net:
